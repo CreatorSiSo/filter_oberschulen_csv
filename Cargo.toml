@@ -1,5 +1,5 @@
 [package]
-name = "filter_oberschulen_csv"
+name = "school_filter_saxony"
 version = "0.1.0"
 edition = "2021"
 
