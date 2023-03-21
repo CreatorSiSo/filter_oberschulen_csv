@@ -1,14 +1,12 @@
+#![feature(iterator_try_collect)]
+
 use dialoguer::console;
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::{FuzzySelect, MultiSelect};
-use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-#[derive(Debug, Serialize, Deserialize)]
-struct District {
-	key: String,
-	name: String,
-}
+mod api;
+use api::{Community, District, IndependetSchool, PublicSchool, School, SchoolType};
 
 fn get_districts() -> anyhow::Result<Vec<District>> {
 	let res = ureq::get("https://schuldatenbank.sachsen.de/api/v1/key_tables/districts?fields[0]=key&fields[1]=name").call()?;
@@ -20,10 +18,16 @@ fn get_districts() -> anyhow::Result<Vec<District>> {
 	Ok(districts)
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct SchoolType {
-	key: String,
-	label: String,
+fn get_communities() -> anyhow::Result<Vec<Community>> {
+	let res =
+		ureq::get("https://schuldatenbank.sachsen.de/api/v1/key_tables/communities?limit=999")
+			.call()?;
+	let json = res.into_string()?;
+	let communities = serde_json::from_str::<Vec<Community>>(&json)?
+		.into_iter()
+		.filter(|community| community.key != "00000000")
+		.collect();
+	Ok(communities)
 }
 
 fn get_school_types() -> anyhow::Result<Vec<SchoolType>> {
@@ -33,48 +37,67 @@ fn get_school_types() -> anyhow::Result<Vec<SchoolType>> {
 	Ok(serde_json::from_str(&json)?)
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct School {
-	institution_key: u32,
-	name: String,
-	abbreviation: String,
-	school_portal_mail: String,
-	school_type_keys: String,
-	building_name: String,
-	building_id: u32,
-	street: String,
-	street_name: String,
-	house_number: String,
-	postcode: String,
-	phone_code_1: Option<String>,
-	phone_number_1: Option<String>,
-	mail: Option<String>,
-	homepage: Option<String>,
-}
-
-fn get_schools_of_type_in_district(
-	school_types: &[&SchoolType],
-	district: &District,
-) -> anyhow::Result<Vec<School>> {
+fn get_public_schools_in_district(district: &District) -> anyhow::Result<Vec<PublicSchool>> {
 	let url = format!(
-		"https://schuldatenbank.sachsen.de/api/v1/schools?limit=999&district_key={}&format=csv",
+		"https://schuldatenbank.sachsen.de/api/v1/schools?format=json&limit=999&district_key={}&only_schools=yes",
 		district.key
 	);
-	let res = ureq::get(&url).call()?;
-	let string_reader = res.into_reader();
-	let mut csv_reader = csv::Reader::from_reader(string_reader);
+	let reader = ureq::get(&url).call()?.into_reader();
+	let schools = serde_json::from_reader(reader)?;
+	Ok(schools)
+}
 
-	let mut schools = vec![];
-	for maybe_school in csv_reader.deserialize() {
-		let school: School = maybe_school?;
-		let mut expected_school_types = school.school_type_keys.split(", ");
-		let correct_school_type = school_types
-			.iter()
-			.any(|school_type| expected_school_types.any(|key| school_type.key == *key));
-		if correct_school_type {
-			schools.push(school);
-		}
-	}
+fn get_independent_schools() -> anyhow::Result<Vec<IndependetSchool>> {
+	let url = "https://schuldatenbank.sachsen.de/api/v1/schools/independent?limit=999";
+	let reader = ureq::get(&url).call()?.into_reader();
+	let schools = serde_json::from_reader(reader)?;
+	Ok(schools)
+}
+
+fn get_schools_of_types_in_district(
+	school_types: &[&SchoolType],
+	district: &District,
+	all_communities: &[Community],
+) -> anyhow::Result<Vec<School>> {
+	let community_names_in_district: Vec<&str> = all_communities
+		.iter()
+		.filter(|community| community.key.starts_with(&district.key))
+		.map(|community| community.name.as_str())
+		.collect();
+
+	let mut schools: Vec<School> = get_public_schools_in_district(district)?
+		.into_iter()
+		.map(|pub_school| pub_school.into_school(school_types))
+		.collect();
+	let mut indep_schools: Vec<School> = get_independent_schools()?
+		.into_iter()
+		.filter(|indep_school| {
+			if schools
+				.iter()
+				.any(|school| school.institution_key == indep_school.institution_key)
+			{
+				return false;
+			}
+			for community_name in &community_names_in_district {
+				if *community_name == indep_school.community {
+					return true;
+				}
+			}
+			false
+		})
+		.map(|indep_school| indep_school.into_school(school_types))
+		.collect();
+	schools.append(&mut indep_schools);
+
+	let schools: Vec<School> = schools
+		.into_iter()
+		.filter(|school| {
+			school
+				.school_types
+				.iter()
+				.any(|school_type| school_types.contains(&school_type))
+		})
+		.collect();
 
 	Ok(schools)
 }
@@ -128,9 +151,11 @@ fn main() -> anyhow::Result<()> {
 		.interact()?;
 	let selected_district = &districts[district_selection];
 
-	let mut schools = get_schools_of_type_in_district(&selected_school_types, selected_district)?;
+	let communities = get_communities()?;
+	let mut schools =
+		get_schools_of_types_in_district(&selected_school_types, selected_district, &communities)?;
 	println!(
-		"  Downloaded data of {} schools",
+		"  Downloaded data of {} public schools",
 		console::style(schools.len().to_string()).cyan()
 	);
 	schools.sort_by(|school_l, school_r| school_l.institution_key.cmp(&school_r.institution_key));
@@ -139,14 +164,13 @@ fn main() -> anyhow::Result<()> {
 		.with_prompt("Output file name")
 		.with_initial_text("./out.csv")
 		.interact()?;
-	let out_path = Path::new(&out_location);
+	let mut writer = csv::Writer::from_path(Path::new(&out_location))?;
 
-	let mut writer = csv::Writer::from_path(out_path)?;
 	for school in schools {
 		writer.serialize(school)?;
 	}
-	writer.flush()?;
 
+	writer.flush()?;
 	println!("  Wrote data to disk",);
 
 	Ok(())
